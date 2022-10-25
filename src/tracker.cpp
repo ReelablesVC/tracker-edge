@@ -19,6 +19,7 @@
 #include "tracker.h"
 #include "tracker_cellular.h"
 #include "mcp_can.h"
+#include "LocationPublish.h"
 
 // Defines and constants
 constexpr int CanSleepRetries = 10; // Based on a series of 10ms delays
@@ -27,7 +28,7 @@ constexpr int TrackerLowBatteryCutoff = 2; // percent of battery charge
 constexpr int TrackerLowBatteryCutoffCorrection = 1; // percent of battery charge
 constexpr int TrackerLowBatteryWarning = 8; // percent of battery charge
 constexpr int TrackerLowBatteryWarningHyst = 1; // percent of battery charge
-constexpr unsigned int TrackerLowBatteryAwakeEvalInterval = 15 * 60; // seconds to sample for low battery condition
+constexpr unsigned int TrackerLowBatteryAwakeEvalInterval = 2 * 60; // seconds to sample for low battery condition
 constexpr unsigned int TrackerLowBatterySleepEvalInterval = 1; // seconds to sample for low battery condition
 constexpr unsigned int TrackerLowBatterySleepWakeInterval = 15 * 60; // seconds to sample for low battery condition
 constexpr system_tick_t TrackerPostChargeSettleTime = 500; // milliseconds
@@ -38,6 +39,12 @@ constexpr unsigned int TrackerChargingSleepEvalTime = 1; // seconds to sample th
 constexpr uint16_t TrackerChargeCurrentHigh = 1024; // milliamps
 constexpr uint16_t TrackerChargeCurrentLow = 512; // milliamps
 constexpr uint16_t TrackerInputCurrent = 1500; // milliamps
+constexpr unsigned int TrackerFailedOtaKeepAwake = 60; // seconds to stay awake after failed OTA
+constexpr system_tick_t TrackerWatchdogExpireTime = 60 * 1000; // milliseconds to expire the WDT
+
+constexpr float TrackerMemfaultBatteryScaling = 10.0f; // scaling for battery SOC reporting
+constexpr float TrackerMemfaultTemperatureScaling = 10.0f; // scaling for temperature reporting
+constexpr float TrackerMemfaultTemperatureInvalid = -300.0f; // invalid temperature
 
 void ctrl_request_custom_handler(ctrl_request* req)
 {
@@ -58,6 +65,11 @@ void ctrl_request_custom_handler(ctrl_request* req)
     system_ctrl_set_result(req, result, nullptr, nullptr, nullptr);
 }
 
+void memfault_metrics_heartbeat_collect_data(void)
+{
+    Tracker::instance().collectMemfaultHeartbeatMetrics();
+}
+
 Tracker *Tracker::_instance = nullptr;
 
 Tracker::Tracker() :
@@ -66,7 +78,6 @@ Tracker::Tracker() :
     sleep(TrackerSleep::instance()),
     locationService(LocationService::instance()),
     motionService(MotionService::instance()),
-    rtc(AM1805_PIN_INVALID, RTC_AM1805_I2C_INSTANCE, RTC_AM1805_I2C_ADDR),
     location(TrackerLocation::instance()),
     motion(TrackerMotion::instance()),
     shipping(TrackerShipping::instance()),
@@ -84,12 +95,28 @@ Tracker::Tracker() :
     _chargeStatus(TrackerChargeState::CHARGE_INIT),
     _lowBatteryEvent(0),
     _evalChargingTick(0),
-    _batteryChargeEnabled(true)
+    _batterySafeToCharge(true),
+    _forceDisableCharging(false)
 {
     _cloudConfig =
     {
         .UsbCommandEnable = true,
     };
+}
+
+void Tracker::collectMemfaultHeartbeatMetrics() {
+    memfault_metrics_heartbeat_set_unsigned(
+        MEMFAULT_METRICS_KEY(Bat_Soc), (uint32_t)(System.batteryCharge() * TrackerMemfaultBatteryScaling));
+
+    if (_model == TRACKER_MODEL_TRACKERONE) {
+        auto temperature = get_temperature();
+
+        memfault_metrics_heartbeat_set_signed(
+            MEMFAULT_METRICS_KEY(Tracker_TempC), (int32_t)(temperature * TrackerMemfaultTemperatureScaling));
+    } else {
+        memfault_metrics_heartbeat_set_signed(
+            MEMFAULT_METRICS_KEY(Tracker_TempC), (int32_t)(TrackerMemfaultTemperatureInvalid * TrackerMemfaultTemperatureScaling));
+    }
 }
 
 int Tracker::registerConfig()
@@ -221,11 +248,11 @@ void Tracker::enableWatchdog(bool enable) {
 #ifndef RTC_WDT_DISABLE
     if (enable) {
         // watchdog at 1 minute
-        rtc.configure_wdt(true, 15, AM1805_WDT_REGISTER_WRB_QUARTER_HZ);
-        rtc.reset_wdt();
+        hal_exrtc_enable_watchdog(TrackerWatchdogExpireTime, nullptr);
+        hal_exrtc_feed_watchdog(nullptr);
     }
     else {
-        rtc.disable_wdt();
+        hal_exrtc_disable_watchdog(nullptr);
     }
 #else
     (void)enable;
@@ -324,7 +351,7 @@ void Tracker::initBatteryMonitor() {
     }
 
     // Keep a handy variable to check on battery charge enablement
-    _batteryChargeEnabled = !powerConfig.isFeatureSet(SystemPowerFeature::DISABLE_CHARGING);
+    _batterySafeToCharge = !powerConfig.isFeatureSet(SystemPowerFeature::DISABLE_CHARGING);
 
     // To initialize the fuel gauge so that it provides semi-accurate readings we
     // want to ensure that the charging circuit is off when providing the
@@ -345,7 +372,8 @@ void Tracker::initBatteryMonitor() {
     // getSoC(), or reading will not have updated yet.
     delay(200);
 
-    if (_batteryChargeEnabled) {
+    _forceDisableCharging = _deviceConfig.disableCharging();
+    if (_batterySafeToCharge && !_forceDisableCharging) {
         pmic.enableCharging();
     }
     pmic.disableWatchdog();
@@ -473,21 +501,38 @@ void Tracker::onSleepStateChange(TrackerSleepContext context)
     }
 }
 
-void Tracker::completeSetupDone()
-{
-    // mark setup as complete to skip mobile app commissioning flow
-    uint8_t val = 0;
-    if(!dct_read_app_data_copy(DCT_SETUP_DONE_OFFSET, &val, DCT_SETUP_DONE_SIZE) && val != 1)
-    {
-        val = 1;
-        dct_write_app_data(&val, DCT_SETUP_DONE_OFFSET, DCT_SETUP_DONE_SIZE);
+void Tracker::otaHandler(system_event_t event, int param) {
+    switch ((unsigned int)param) {
+        case SystemEventsParam::firmware_update_complete: {
+            // There will be an imminent system reset so disable the watchdog
+            enableWatchdog(false);
+        }
+        break;
+
+        case SystemEventsParam::firmware_update_begin: {
+            if (!sleep.isSleepDisabled()) {
+                // Don't allow the device to go asleep if an OTA has begun
+                sleep.pauseSleep();
+            }
+        }
+        break;
+
+        case SystemEventsParam::firmware_update_failed: {
+            if (!sleep.isSleepDisabled()) {
+                // Allow the device to go asleep after a chance for the cloud to restart a failed OTA
+                sleep.extendExecutionFromNow(TrackerFailedOtaKeepAwake);
+                sleep.resumeSleep();
+            }
+        }
+        break;
+
+        default:
+            break;
     }
 }
 
 void Tracker::startup()
 {
-    completeSetupDone();
-
     // Correct power manager states in the DCT
     enablePowerManagement();
 }
@@ -497,6 +542,13 @@ int Tracker::init()
     int ret = 0;
 
     _lastLoopSec = System.uptime();
+
+    // Disable OTA updates until after the system handler has been registered
+    System.disableUpdates();
+
+    if (nullptr == _memfault) {
+        _memfault = new Memfault(TRACKER_PRODUCT_VERSION);
+    }
 
 #ifndef TRACKER_MODEL_NUMBER
     ret = hal_get_device_hw_model(&_model, &_variant, nullptr);
@@ -527,6 +579,17 @@ int Tracker::init()
         initBatteryMonitor();
     }
 
+    // Setup device monitoring configuration here
+    static ConfigObject deviceMonitoringDesc
+    (
+        "monitoring",
+        {
+            ConfigBool("device_monitor", &_deviceMonitoring)
+        }
+    );
+
+    ConfigService::instance().registerModule(deviceMonitoringDesc);
+
     cloudService.init();
 
     configService.init();
@@ -540,22 +603,17 @@ int Tracker::init()
     // Register our own configuration settings
     registerConfig();
 
-    ret = locationService.begin(UBLOX_SPI_INTERFACE,
-        UBLOX_CS_PIN,
-        UBLOX_PWR_EN_PIN,
-        UBLOX_TX_READY_MCU_PIN,
-        UBLOX_TX_READY_GPS_PIN);
+    ret = locationService.begin(_deviceConfig.locationServiceConfig());
     if (ret)
     {
         Log.error("Failed to begin location service");
     }
 
-    locationService.start();
-
     // Check for Tracker One hardware
     if (_model == TRACKER_MODEL_TRACKERONE)
     {
         (void)GnssLedInit();
+        GnssLedEnable(true);
         temperature_init(TRACKER_THERMISTOR,
             [this](TemperatureChargeEvent event){ return chargeCallback(event); }
         );
@@ -563,7 +621,7 @@ int Tracker::init()
 
     motionService.start();
 
-    location.init();
+    location.init(_deviceConfig.gnssRetryCount());
 
     motion.init();
 
@@ -578,8 +636,22 @@ int Tracker::init()
 
     rgb.init();
 
-    rtc.begin();
     enableWatchdog(true);
+
+    LocationPublish::instance().init();
+
+    // Associate handler to OTAs and pending resets to disable the watchdog
+    System.on(reset_pending,
+        [this](system_event_t event, int param){
+            // Stop everything
+            stop();
+            end();
+        }
+    );
+    System.on(firmware_update, [this](system_event_t event, int param){ otaHandler(event, param); });
+
+    // Allow OTAs now that the firmware update handlers are registered
+    System.enableUpdates();
 
     location.regLocGenCallback(loc_gen_cb);
 
@@ -596,7 +668,7 @@ void Tracker::loop()
         _lastLoopSec = cur_sec;
 
 #ifndef RTC_WDT_DISABLE
-        rtc.reset_wdt();
+        hal_exrtc_feed_watchdog(nullptr);
 #endif
     }
 
@@ -630,6 +702,9 @@ void Tracker::loop()
     // fast operations for every loop
     cloudService.tick();
     configService.tick();
+    if (_deviceMonitoring && (nullptr != _memfault)) {
+        _memfault->process();
+    }
     location.loop();
 }
 
@@ -643,13 +718,20 @@ int Tracker::stop() {
 int Tracker::end() {
     enableIoCanPower(false);
     GnssLedEnable(false);
+    enableWatchdog(false);
 
     return SYSTEM_ERROR_NONE;
 }
 
-int Tracker::enableCharging() {
-    _batteryChargeEnabled = true;
+int Tracker::reset() {
+    stop();
+    end();
+    System.reset();
 
+    return SYSTEM_ERROR_NONE;
+}
+
+int Tracker::pmicEnableCharging() {
     auto powerConfig = System.getPowerConfiguration();
     if (powerConfig.isFeatureSet(SystemPowerFeature::DISABLE_CHARGING)) {
         powerConfig.clearFeature(SystemPowerFeature::DISABLE_CHARGING);
@@ -659,9 +741,7 @@ int Tracker::enableCharging() {
     return SYSTEM_ERROR_NONE;
 }
 
-int Tracker::disableCharging() {
-    _batteryChargeEnabled = false;
-
+int Tracker::pmicDisableCharging() {
     auto powerConfig = System.getPowerConfiguration();
     if (!powerConfig.isFeatureSet(SystemPowerFeature::DISABLE_CHARGING)) {
         powerConfig.feature(SystemPowerFeature::DISABLE_CHARGING);
@@ -669,6 +749,19 @@ int Tracker::disableCharging() {
     }
 
     return SYSTEM_ERROR_NONE;
+}
+
+void Tracker::forceDisableCharging(bool value) {
+    _forceDisableCharging = value;
+
+    if (_forceDisableCharging) {
+        pmicDisableCharging();
+    }
+    else {
+        if (_batterySafeToCharge) {
+            pmicEnableCharging();
+        }
+    }
 }
 
 int Tracker::setChargeCurrent(uint16_t current) {
@@ -711,11 +804,15 @@ int Tracker::chargeCallback(TemperatureChargeEvent event) {
     }
 
     // Check if anything needs to be changed for charging
-    if (!shouldCharge && _batteryChargeEnabled) {
-        disableCharging();
+    if (!shouldCharge && _batterySafeToCharge) {
+        _batterySafeToCharge = false;
+        pmicDisableCharging();
     }
-    else if (shouldCharge && !_batteryChargeEnabled) {
-        enableCharging();
+    else if (shouldCharge && !_batterySafeToCharge) {
+        _batterySafeToCharge = true;
+        if (!_forceDisableCharging) {
+            pmicEnableCharging();
+        }
     }
 
     return SYSTEM_ERROR_NONE;

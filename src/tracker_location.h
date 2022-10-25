@@ -21,6 +21,7 @@
 #include "location_service.h"
 #include "motion_service.h"
 #include "tracker_sleep.h"
+#include "Geofence.h"
 
 #define TRACKER_LOCATION_INTERVAL_MIN_DEFAULT_SEC (900)
 #define TRACKER_LOCATION_INTERVAL_MAX_DEFAULT_SEC (3600)
@@ -39,47 +40,7 @@
 constexpr int TrackerLocationMaxWpsCollect = 20;
 constexpr int TrackerLocationMaxWpsSend = 5;
 constexpr int TrackerLocationMaxTowerSend = 3;
-
-enum class RadioAccessTechnology {
-    NONE = -1,
-    LTE = 7,
-    LTE_CAT_M1 = 8,
-    LTE_NB_IOT = 9
-};
-
-struct CellularServing {
-	RadioAccessTechnology rat;
-	unsigned int mcc;       // 0-999
-	unsigned int mnc;       // 0-999
-	uint32_t cellId;        // 28-bits
-	unsigned int tac;       // 16-bits
-	int signalPower;
-
-	CellularServing() :
-		rat(RadioAccessTechnology::NONE),
-		mcc(0),
-		mnc(0),
-		cellId(0),
-		tac(0),
-		signalPower(0) {}
-};
-
-struct CellularNeighbors {
-	RadioAccessTechnology rat;
-	uint32_t earfcn;		// 28-bits
-	uint32_t neighborId;	// 0-503
-	int signalQuality;
-	int signalPower;
-	int signalStrength;
-
-	CellularNeighbors() :
-		rat(RadioAccessTechnology::NONE),
-		earfcn(0),
-		neighborId(0),
-		signalQuality(0),
-		signalPower(0),
-		signalStrength(0) {}
-};
+constexpr int NUM_OF_GEOFENCE_ZONES = 4;
 
 struct tracker_location_config_t {
     int32_t interval_min_seconds; // 0 = no min
@@ -121,6 +82,10 @@ struct EvaluationResults {
     bool lockWait;
 };
 
+struct TrackerGeofenceConfig {
+    int32_t interval; // seconds
+};
+
 class TrackerLocation
 {
     public:
@@ -138,7 +103,13 @@ class TrackerLocation
             return *_instance;
         }
 
-        void init();
+        /**
+         * @brief Initialize the TrackerLocation object
+         *
+         * @param gnssRetries GNSS initialization retry count
+         */
+        void init(unsigned int gnssRetries);
+
         void loop();
 
         // register for callback during generation of location publish allowing
@@ -166,6 +137,15 @@ class TrackerLocation
             T *instance,
             const void *context=nullptr);
 
+        int regPendLocPubCallback(cloud_service_send_cb_t cb,
+                                const void *context=nullptr);
+
+        template <typename T>
+        int regPendLocPubCallback(
+            int (T::*cb)(CloudServiceStatus status, JSONValue *, const char *, const void *context),
+            T *instance,
+            const void *context=nullptr);
+
         // register for callback after location publish for the cloud supplied ehanced callback
         // these callbacks are persistent and not removed on generation
         int regEnhancedLocCallback(
@@ -187,22 +167,35 @@ class TrackerLocation
 
         int addWap(WiFiAccessPoint* wap);
 
+        Geofence& getGeoFence() {
+            return _geofence;
+        }
+        bool isProcessAckEnabled() {return _config_state.process_ack;}
+        int location_publish_cb(CloudServiceStatus status, JSONValue *, const char *req_event, const void *context);
+        void issue_location_publish_callbacks(CloudServiceStatus status, JSONValue *, const char *req_event);
+
     private:
         TrackerLocation() :
             _sleep(TrackerSleep::instance()),
+            _geofence(NUM_OF_GEOFENCE_ZONES),
             _loopSampleTick(0),
             _pending_immediate(false),
             _first_publish(true),
             _pending_first_publish(false),
+            _pendingShutdown(false),
             _earlyWake(0),
             _nextEarlyWake(0),
-            location_publish_retry_str(nullptr),
+            _pendingGeofence(false),
+            _lastInterval(0),
+            _publishAttempted(0),
             _monotonic_publish_sec(0),
             _newMonotonic(true),
             _firstLockSec(0),
             _gnssStartedSec(0),
-            _lastGnssState(GnssState::OFF)
-        {
+            _lastGnssState(GnssState::OFF),
+            _gnssRetryDefault(0),
+            _gnssCycleCurrent(0) {
+
             _config_state = {
                 .interval_min_seconds = TRACKER_LOCATION_INTERVAL_MIN_DEFAULT_SEC,
                 .interval_max_seconds = TRACKER_LOCATION_INTERVAL_MAX_DEFAULT_SEC,
@@ -220,6 +213,7 @@ class TrackerLocation
         }
         static TrackerLocation *_instance;
         TrackerSleep& _sleep;
+        Geofence _geofence;
 
         RecursiveMutex mutex;
 
@@ -228,53 +222,64 @@ class TrackerLocation
         bool _pending_immediate;
         bool _first_publish;
         bool _pending_first_publish;
+        bool _pendingShutdown;
         unsigned int _earlyWake;
         unsigned int _nextEarlyWake;
-
-        char *location_publish_retry_str;
+        TrackerGeofenceConfig _geofenceConfig {};
+        bool _pendingGeofence;
 
         int enter_location_config_cb(bool write, const void *context);
         int exit_location_config_cb(bool write, int status, const void *context);
 
         int get_loc_cb(CloudServiceStatus status, JSONValue *root, const void *context);
 
-        int location_publish_cb(CloudServiceStatus status, JSONValue *, const char *req_event, const void *context);
-
-        void issue_location_publish_callbacks(CloudServiceStatus status, JSONValue *, const char *req_event);
-
         void location_publish();
 
         bool isSleepEnabled();
         void enableNetwork();
-        void enableGnss();
-        void disableGnss();
-        void enableWifi();
-        void disableWifi();
+        int enableGnss();
+        int disableGnss();
         void onSleepPrepare(TrackerSleepContext context);
         void onSleep(TrackerSleepContext context);
         void onSleepCancel(TrackerSleepContext context);
         void onWake(TrackerSleepContext context);
         void onSleepState(TrackerSleepContext context);
-        EvaluationResults evaluatePublish();
-        void buildPublish(LocationPoint& cur_loc);
+        void onGeofenceCallback(CallbackContext& context);
+        EvaluationResults evaluatePublish(bool error);
+        void buildPublish(LocationPoint& cur_loc, bool error = false);
         GnssState loopLocation(LocationPoint& cur_loc);
-        static int parseServeCell(const char* in, CellularServing& out);
         size_t buildTowerInfo(JSONBufferWriter& writer, size_t size);
-        static int serving_cb(int type, const char* buf, int len, TrackerLocation* context);
-        static int parseCell(const char* in, CellularNeighbors& out);
-        static int neighbor_cb(int type, const char* buf, int len, TrackerLocation* context);
         static void wifi_cb(WiFiAccessPoint* wap, TrackerLocation* context);
         size_t buildWpsInfo(JSONBufferWriter& writer, size_t size);
 
         int buildEnhLocation(JSONValue& node, LocationPoint& point);
         int enhanced_cb(CloudServiceStatus status, JSONValue* root, const void* context);
 
+        unsigned int setGnssCycle() {
+            return _gnssCycleCurrent = _gnssRetryDefault + 1; // Initial attempt plus retries
+        }
+
+        unsigned int getGnssCycle() const {
+            return _gnssCycleCurrent;
+        }
+
+        unsigned int decGnssCycle() {
+            if (0 != _gnssCycleCurrent) {
+                _gnssCycleCurrent--;
+            }
+            return _gnssCycleCurrent;
+        }
+
         uint32_t _last_location_publish_sec;
+        int32_t _lastInterval;
+        std::atomic<size_t> _publishAttempted;
         uint32_t _monotonic_publish_sec;
         bool _newMonotonic;
         uint32_t _firstLockSec;
         uint32_t _gnssStartedSec;
         GnssState _lastGnssState;
+        unsigned int _gnssRetryDefault;
+        unsigned int _gnssCycleCurrent;
 
         tracker_location_config_t _config_state, _config_state_shadow, _config_state_loop_safe;
 
@@ -288,8 +293,6 @@ class TrackerLocation
         os_queue_t _enhancedLocQueue;
 
         Vector<WiFiAccessPoint> wpsList;
-        CellularServing servingTower;
-        Vector<CellularNeighbors> towerList;
 };
 
 template <typename T>
@@ -298,7 +301,7 @@ int TrackerLocation::regLocGenCallback(
     T *instance,
     const void *context)
 {
-    return regLocGenCallback(std::bind(cb, instance, _1, _2), context);
+    return regLocGenCallback(std::bind(cb, instance, _1, _2, _3), context);
 }
 
 template <typename T>
@@ -307,7 +310,16 @@ int TrackerLocation::regLocPubCallback(
     T *instance,
     const void *context)
 {
-    return regLocPubCallback(std::bind(cb, instance, _1, _2, _3), context);
+    return regLocPubCallback(std::bind(cb, instance, _1, _2, _3, _4), context);
+}
+
+template <typename T>
+int TrackerLocation::regPendLocPubCallback(
+    int (T::*cb)(CloudServiceStatus status, JSONValue *, const char *, const void *context),
+    T *instance,
+    const void *context)
+{
+    return regPendLocPubCallback(std::bind(cb, instance, _1, _2, _3, _4), context);
 }
 
 template <typename T>

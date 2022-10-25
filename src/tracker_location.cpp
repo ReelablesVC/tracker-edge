@@ -20,9 +20,11 @@
 #include "Particle.h"
 #include "tracker_config.h"
 #include "tracker_location.h"
+#include "tracker_cellular.h"
 
 #include "config_service.h"
 #include "location_service.h"
+#include "LocationPublish.h"
 
 TrackerLocation *TrackerLocation::_instance = nullptr;
 
@@ -30,6 +32,8 @@ static constexpr system_tick_t LoopSampleRate = 1000; // milliseconds
 static constexpr uint32_t EarlySleepSec = 2; // seconds
 static constexpr uint32_t MiscSleepWakeSec = 3; // seconds - miscellaneous time spent by system entering and exiting sleep
 static constexpr uint32_t LockTimeoutSec = 10; // seconds - time to wait for GNSS lock (sleep disabled)
+static constexpr uint32_t WifiPowerOnSec = 3; // seconds - time to wait for WiFi power on
+static constexpr uint32_t WifiPowerScanSec = 1; // seconds - time to wait for WiFi scan
 
 static constexpr size_t EnhancedLocationQueueSize = 5; // up to this many elements
 static constexpr size_t ObjectEstimateWpsHeaderSize = sizeof(",{\"wps\":[]}") - 1 /* null */;
@@ -87,7 +91,7 @@ int TrackerLocation::get_loc_cb(CloudServiceStatus status,
    return 0;
 }
 
-void TrackerLocation::init()
+void TrackerLocation::init(unsigned int gnssRetries)
 {
     static ConfigObject location_desc
     (
@@ -136,6 +140,71 @@ void TrackerLocation::init()
 
     ConfigService::instance().registerModule(location_desc);
 
+    static ConfigObject geofence_desc("geofence", {
+        ConfigInt("interval", &_geofenceConfig.interval, 0, 86400l),
+        ConfigObject("zone1", {
+            ConfigBool("enable", &_geofence.GetZoneInfo(0).enable),
+            ConfigFloat("lat", &_geofence.GetZoneInfo(0).center_lat),
+            ConfigFloat("lon", &_geofence.GetZoneInfo(0).center_lon),
+            ConfigFloat("radius", &_geofence.GetZoneInfo(0).radius),
+            ConfigBool("outside", &_geofence.GetZoneInfo(0).outside_event),
+            ConfigBool("inside", &_geofence.GetZoneInfo(0).inside_event),
+            ConfigBool("enter", &_geofence.GetZoneInfo(0).enter_event),
+            ConfigBool("exit", &_geofence.GetZoneInfo(0).exit_event),
+            ConfigInt("verif", &_geofence.GetZoneInfo(0).verification_time_sec),
+            ConfigStringEnum("shape_type", {
+                {"circular", (int32_t) GeofenceShapeType::CIRCULAR},
+                {"polygonal", (int32_t) GeofenceShapeType::POLYGONAL}
+            }, &_geofence.GetZoneInfo(0).shape_type)
+        }),
+        ConfigObject("zone2", {
+            ConfigBool("enable", &_geofence.GetZoneInfo(1).enable),
+            ConfigFloat("lat", &_geofence.GetZoneInfo(1).center_lat),
+            ConfigFloat("lon", &_geofence.GetZoneInfo(1).center_lon),
+            ConfigFloat("radius", &_geofence.GetZoneInfo(1).radius),
+            ConfigBool("outside", &_geofence.GetZoneInfo(1).outside_event),
+            ConfigBool("inside", &_geofence.GetZoneInfo(1).inside_event),
+            ConfigBool("enter", &_geofence.GetZoneInfo(1).enter_event),
+            ConfigBool("exit", &_geofence.GetZoneInfo(1).exit_event),
+            ConfigInt("verif", &_geofence.GetZoneInfo(1).verification_time_sec),
+            ConfigStringEnum("shape_type", {
+                {"circular", (int32_t) GeofenceShapeType::CIRCULAR},
+                {"polygonal", (int32_t) GeofenceShapeType::POLYGONAL}
+            }, &_geofence.GetZoneInfo(1).shape_type)
+        }),
+        ConfigObject("zone3", {
+            ConfigBool("enable", &_geofence.GetZoneInfo(2).enable),
+            ConfigFloat("lat", &_geofence.GetZoneInfo(2).center_lat),
+            ConfigFloat("lon", &_geofence.GetZoneInfo(2).center_lon),
+            ConfigFloat("radius", &_geofence.GetZoneInfo(2).radius),
+            ConfigBool("outside", &_geofence.GetZoneInfo(2).outside_event),
+            ConfigBool("inside", &_geofence.GetZoneInfo(2).inside_event),
+            ConfigBool("enter", &_geofence.GetZoneInfo(2).enter_event),
+            ConfigBool("exit", &_geofence.GetZoneInfo(2).exit_event),
+            ConfigInt("verif", &_geofence.GetZoneInfo(2).verification_time_sec),
+            ConfigStringEnum("shape_type", {
+                {"circular", (int32_t) GeofenceShapeType::CIRCULAR},
+                {"polygonal", (int32_t) GeofenceShapeType::POLYGONAL}
+            }, &_geofence.GetZoneInfo(2).shape_type)
+        }),
+        ConfigObject("zone4", {
+            ConfigBool("enable", &_geofence.GetZoneInfo(3).enable),
+            ConfigFloat("lat", &_geofence.GetZoneInfo(3).center_lat),
+            ConfigFloat("lon", &_geofence.GetZoneInfo(3).center_lon),
+            ConfigFloat("radius", &_geofence.GetZoneInfo(3).radius),
+            ConfigBool("outside", &_geofence.GetZoneInfo(3).outside_event),
+            ConfigBool("inside", &_geofence.GetZoneInfo(3).inside_event),
+            ConfigBool("enter", &_geofence.GetZoneInfo(3).enter_event),
+            ConfigBool("exit", &_geofence.GetZoneInfo(3).exit_event),
+            ConfigInt("verif", &_geofence.GetZoneInfo(3).verification_time_sec),
+            ConfigStringEnum("shape_type", {
+                {"circular", (int32_t) GeofenceShapeType::CIRCULAR},
+                {"polygonal", (int32_t) GeofenceShapeType::POLYGONAL}
+            }, &_geofence.GetZoneInfo(3).shape_type)
+        }),
+    });
+    ConfigService::instance().registerModule(geofence_desc);
+
     CloudService::instance().regCommandCallback("get_loc", &TrackerLocation::get_loc_cb, this);
 
     _last_location_publish_sec = System.uptime() - _config_state.interval_min_seconds;
@@ -146,7 +215,13 @@ void TrackerLocation::init()
     _sleep.registerWake([this](TrackerSleepContext context){ this->onWake(context); });
     _sleep.registerStateChange([this](TrackerSleepContext context){ this->onSleepState(context); });
 
+    _geofence.RegisterGeofenceCallback([this](CallbackContext& context){ this->onGeofenceCallback(context); });
+    _geofence.init();
+
     CloudService::instance().regCommandCallback("loc-enhanced", &TrackerLocation::enhanced_cb, this);
+
+    _gnssRetryDefault = gnssRetries;
+    setGnssCycle();
 }
 
 int TrackerLocation::buildEnhLocation(JSONValue& node, LocationPoint& point) {
@@ -157,13 +232,13 @@ int TrackerLocation::buildEnhLocation(JSONValue& node, LocationPoint& point) {
             if (!locChild.value().isNumber()) {
                 return -EINVAL;
             }
-            point.latitude = (float)locChild.value().toDouble();
+            point.latitude = locChild.value().toDouble();
         }
         else if (locChild.name() == "lon") {
             if (!locChild.value().isNumber()) {
                 return -EINVAL;
             }
-            point.longitude = (float)locChild.value().toDouble();
+            point.longitude = locChild.value().toDouble();
         }
         else if (locChild.name() == "h_acc") {
             if (!locChild.value().isNumber()) {
@@ -248,6 +323,14 @@ int TrackerLocation::regLocPubCallback(
     return 0;
 }
 
+int TrackerLocation::regPendLocPubCallback(
+    cloud_service_send_cb_t cb,
+    const void *context)
+{
+    pendingLocPubCallbacks.append(std::bind(cb, _1, _2, _3, context));
+    return 0;
+}
+
 int TrackerLocation::regEnhancedLocCallback(
     std::function<void(const LocationPoint &, const void *)> cb,
     const void *context)
@@ -294,8 +377,6 @@ void TrackerLocation::issue_location_publish_callbacks(CloudServiceStatus status
 
 int TrackerLocation::location_publish_cb(CloudServiceStatus status, JSONValue *rsp_root, const char *req_event, const void *context)
 {
-    bool issue_callbacks = true;
-
     if(status == CloudServiceStatus::SUCCESS)
     {
         // this could either be on the Particle Cloud ack (default) OR the
@@ -306,22 +387,6 @@ int TrackerLocation::location_publish_cb(CloudServiceStatus status, JSONValue *r
     }
     else if(status == CloudServiceStatus::FAILURE)
     {
-        // right now FAILURE only comes out of a Particle Cloud issue
-        // once Particle Cloud passes if waiting on end-to-end it will
-        // only ever timeout
-
-        // save on failure for retry
-        if(req_event && !location_publish_retry_str)
-        {
-            size_t len = strlen(req_event) + 1;
-            location_publish_retry_str = (char *) malloc(len);
-            if(location_publish_retry_str)
-            {
-                memcpy(location_publish_retry_str, req_event, len);
-                // we've saved for retry, defer callbacks until retry completes
-                issue_callbacks = false;
-            }
-        }
         Log.info("location cb publish %lu failure", *(uint32_t *) context);
     }
     else if(status == CloudServiceStatus::TIMEOUT)
@@ -333,10 +398,9 @@ int TrackerLocation::location_publish_cb(CloudServiceStatus status, JSONValue *r
         Log.info("location cb publish %lu unexpected status: %d", *(uint32_t *) context, status);
     }
 
-    if(issue_callbacks)
-    {
-        issue_location_publish_callbacks(status, rsp_root, req_event);
-    }
+    _publishAttempted++;
+
+    issue_location_publish_callbacks(status, rsp_root, req_event);
 
     return 0;
 }
@@ -353,88 +417,42 @@ void TrackerLocation::location_publish()
     CloudServicePublishFlags cloud_flags =
         (_config_state.process_ack) ? CloudServicePublishFlags::FULL_ACK : CloudServicePublishFlags::NONE;
 
-    if(location_publish_retry_str)
-    {
-        // publish a retry loc
-        rval = cloud_service.send(location_publish_retry_str,
-            WITH_ACK,
-            cloud_flags,
-            &TrackerLocation::location_publish_cb, this,
-            CLOUD_DEFAULT_TIMEOUT_MS, &_last_location_publish_sec);
-    }
-    else
-    {
-        // publish a new loc (contained in cloud_service buffer)
-        rval = cloud_service.send(WITH_ACK,
-            cloud_flags,
-            &TrackerLocation::location_publish_cb, this,
-            CLOUD_DEFAULT_TIMEOUT_MS, &_last_location_publish_sec);
-    }
+    // publish a new loc (contained in cloud_service buffer)
+    rval = cloud_service.send(WITH_ACK,
+        cloud_flags,
+        &TrackerLocation::location_publish_cb, this,
+        CLOUD_DEFAULT_TIMEOUT_MS, &_last_location_publish_sec);
 
-    if(rval == -EBUSY)
+    //if error issue the user defined callbacks
+    if(rval)
     {
-        // this implies a transient failure that should recover very
-        // quickly (normally another publish in progress blocking lower
-        // in the system)
-        // save off the generated publish to retry as it has already
-        // consumed pending events if applicable
-        if(!location_publish_retry_str)
-        {
-            size_t len = strlen(cloud_service.writer().buffer()) + 1;
-            location_publish_retry_str = (char *) malloc(len);
-            if(location_publish_retry_str)
-            {
-                memcpy(location_publish_retry_str, cloud_service.writer().buffer(), len);
-            }
-            else
-            {
-                // generated successfuly but unable to save off a copy to retry
-                issue_location_publish_callbacks(CloudServiceStatus::FAILURE, NULL, cloud_service.writer().buffer());
-            }
-        }
-    }
-    else
-    {
-        if(rval)
-        {
-            issue_location_publish_callbacks(CloudServiceStatus::FAILURE, NULL, location_publish_retry_str);
-        }
-        if(location_publish_retry_str)
-        {
-            // on success or fatal failure free it
-            free(location_publish_retry_str);
-            location_publish_retry_str = nullptr;
-        }
+        issue_location_publish_callbacks(CloudServiceStatus::FAILURE, NULL, cloud_service.writer().buffer());
     }
     cloud_service.unlock();
 }
 
 void TrackerLocation::enableNetwork() {
     _sleep.forceFullWakeCycle();
+}
+
+int TrackerLocation::enableGnss() {
+    auto ret = LocationService::instance().start();
+    if (SYSTEM_ERROR_NONE != ret) {
+        decGnssCycle();
+    }
     _gnssStartedSec = System.uptime();
+    return ret;
 }
 
-void TrackerLocation::enableGnss() {
-    LocationService::instance().start();
-}
-
-void TrackerLocation::disableGnss() {
-    LocationService::instance().stop();
-}
-
-void TrackerLocation::enableWifi() {
-    WiFi.on();
-}
-
-void TrackerLocation::disableWifi() {
-    WiFi.off();
+int TrackerLocation::disableGnss() {
+    return LocationService::instance().stop();
 }
 
 bool TrackerLocation::isSleepEnabled() {
     return !_sleep.isSleepDisabled();
 }
 
-EvaluationResults TrackerLocation::evaluatePublish() {
+EvaluationResults TrackerLocation::evaluatePublish(bool error) {
     auto now = System.uptime();
 
     if (_pending_immediate) {
@@ -447,7 +465,7 @@ EvaluationResults TrackerLocation::evaluatePublish() {
     // This may be pre-emptively published due to connect and execute times if sleep is enabled.
     // If sleep is disabled then timeout after some time.
     if (_first_publish && !_pending_first_publish) {
-        Log.trace("%s first", __FUNCTION__);
+        //Log.trace("%s first", __FUNCTION__);
         return EvaluationResults {PublishReason::TRIGGERS, true, (now - _gnssStartedSec) < (uint32_t)_sleep.getConfigConnectingTime()};
     }
 
@@ -506,21 +524,23 @@ EvaluationResults TrackerLocation::evaluatePublish() {
 // the next time it needs to wake and process inputs, publish, and what not.
 void TrackerLocation::onSleepPrepare(TrackerSleepContext context) {
     // The first thing to figure out is the needed interval, min or max
-    unsigned int wake = _last_location_publish_sec;
-    int32_t interval = 0;
-    if (_pending_triggers.size()) {
-        interval = _config_state.interval_min_seconds;
-        wake += interval;
+    int32_t interval = (_pending_triggers.size()) ?
+        _config_state.interval_min_seconds : _config_state.interval_max_seconds;
+
+    auto published = (0 != _publishAttempted.exchange(0));
+    auto fullWake = _sleep.isFullWakeCycle();
+    if (fullWake && !published) {
+        _last_location_publish_sec = (_lastInterval) ?
+            (_last_location_publish_sec + _lastInterval) : System.uptime();
     }
-    else {
-        interval = _config_state.interval_max_seconds;
-        wake += interval;
-    }
+    unsigned int wake = _last_location_publish_sec + interval;
+
+    _lastInterval = interval;
 
     // Next calculate the early wake offset so that we can wake in the minimum amount of time before
     // the next publish in order to minimize time spent in fully powered operation
     auto t_conn = (uint32_t)_sleep.getConfigConnectingTime();
-    if (_sleep.isFullWakeCycle()) {
+    if (fullWake) {
         uint32_t newEarlyWakeSec = 0;
         uint32_t lastWakeSec = (uint32_t)(context.lastWakeMs + 500) / 1000; // Round ms to s
         if (lastWakeSec >= MiscSleepWakeSec) {
@@ -553,11 +573,21 @@ void TrackerLocation::onSleepPrepare(TrackerSleepContext context) {
     if (wake > _nextEarlyWake)
         wake -= _nextEarlyWake;
 
+    if (_geofenceConfig.interval && _config_state_loop_safe.gnss && _geofence.AnyGeofenceEnabled()) {
+        unsigned int geoWake = System.uptime() + (unsigned int)_geofenceConfig.interval;
+        if (geoWake < wake) {
+            wake = geoWake;
+        }
+        _pendingGeofence = true;
+    }
+
     TrackerSleepError wakeRet = _sleep.wakeAtSeconds(wake);
 
     if (wakeRet == TrackerSleepError::TIME_IN_PAST) {
         wake = 0; // Force cancelled sleep
         _sleep.wakeAtSeconds(wake);
+        // Extend to something that will be eventually overrided by the publish evaluation and main loop
+        _sleep.extendExecutionFromNow(interval + _sleep.getConfigExecuteTime());
     }
 
     Log.trace("TrackerLocation: last=%lu, interval=%ld, wake=%u", _last_location_publish_sec, interval, wake);
@@ -572,7 +602,6 @@ void TrackerLocation::onSleepCancel(TrackerSleepContext context) {
 // of no return to cancel the pending sleep cycle.
 void TrackerLocation::onSleep(TrackerSleepContext context) {
     disableGnss();
-    disableWifi();
 }
 
 // This callback will be called immediately after wake from sleep and allows us to figure out if the network interface
@@ -581,19 +610,17 @@ void TrackerLocation::onWake(TrackerSleepContext context) {
     // Allow capturing of the first lock instance
     _firstLockSec = 0;
 
-    auto result = evaluatePublish();
+    auto result = evaluatePublish(false);
 
     if (result.networkNeeded) {
         enableNetwork();
-        if (_config_state_loop_safe.gnss) {
-            enableGnss();
-        }
-        if (_config_state_loop_safe.enhance_loc) {
-            if (_config_state_loop_safe.wps) {
-                enableWifi();
-            }
-        }
+        // GNSS power state handled elsewhere
+        // TODO: Need to support GNSS Warm Start when unit has been off for more than 4 hours
         Log.trace("%s needs to start the network", __FUNCTION__);
+    }
+    else if (_geofenceConfig.interval && _pendingGeofence) {
+        Log.trace("%s needs to evaluate geofences", __FUNCTION__);
+        _sleep.extendExecution(_sleep.getConfigConnectingTime());
     }
     else {
         // Put in our vote to shutdown early
@@ -607,111 +634,62 @@ void TrackerLocation::onWake(TrackerSleepContext context) {
 void TrackerLocation::onSleepState(TrackerSleepContext context) {
     switch (context.reason) {
         case TrackerSleepReason::STATE_TO_CONNECTING: {
-            Log.trace("%s starting GNSS", __FUNCTION__);
-            LocationService::instance().start();
             break;
         }
 
         case TrackerSleepReason::STATE_TO_SHUTDOWN: {
             Log.trace("%s stopping GNSS for shutdown", __FUNCTION__);
             disableGnss();
+            Log.trace("%s stopping WiFi for shutdown", __FUNCTION__);
+            if (WiFi.isOn()) {
+                WiFi.off();
+            }
+            _pendingShutdown = true;
             break;
         }
     }
 }
 
-int TrackerLocation::parseServeCell(const char* in, CellularServing& out) {
-    CellularServing ret;
-    char state[16] = {};
-    char rat[16] = {};
+void TrackerLocation::onGeofenceCallback(CallbackContext& context) {
+    // Associate the zone with static zone strings
+    char* zoneStr = nullptr;
+    constexpr const char* outsideStr[] = {"outside1", "outside2", "outside3", "outside4"};
+    constexpr const char* insideStr[] = {"inside1", "inside2", "inside3", "inside4"};
+    constexpr const char* enterStr[] = {"enter1", "enter2", "enter3", "enter4"};
+    constexpr const char* exitStr[] = {"exit1", "exit2", "exit3", "exit4"};
 
-    out = {};
-    auto nitems = sscanf(in, " +QENG: \"servingcell\",\"%15[^\"]\",\"%15[^\"]\",\"%*15[^\"]\","
-            "%u,%u,%lX,"
-            "%*15[^,],%*15[^,],%*15[^,],%*15[^,],%*15[^,],%X,%d",
-            state, rat,
-            &ret.mcc, &ret.mnc, &ret.cellId, &ret.tac, &ret.signalPower);
+    switch(context.event_type) {
+        case GeofenceEventType::OUTSIDE:
+            zoneStr = (char*)outsideStr[context.index];
+            //Log.info("Outside CB Triggered in %s", zoneStr);
+            break;
 
-    if (nitems < 7) {
-        return SYSTEM_ERROR_NOT_ENOUGH_DATA;
+        case GeofenceEventType::INSIDE:
+            zoneStr = (char*)insideStr[context.index];
+            //Log.info("Inside CB Triggered in %s", zoneStr);
+            break;
+
+        case GeofenceEventType::ENTER:
+            zoneStr = (char*)enterStr[context.index];
+            //Log.info("Enter CB Triggered in %s", zoneStr);
+            break;
+
+        case GeofenceEventType::EXIT:
+            zoneStr = (char*)exitStr[context.index];
+            //Log.info("Exit CB Triggered in %s", zoneStr);
+            break;
+
+        case GeofenceEventType::POOR_LOCATION:
+            // Do nothing
+            //Log.info("Poor location CB triggered in zone %d", context.index);
+            return;
+
+        default:
+            Log.error("Unsupported event type %d", (int)context.event_type);
+            return;
     }
 
-    if (!strncmp(rat, "CAT-M", 5)) {
-        out.rat = RadioAccessTechnology::LTE_CAT_M1;
-    }
-    else if (!strncmp(rat, "LTE", 3)) {
-        out.rat = RadioAccessTechnology::LTE;
-    }
-    else if (!strncmp(rat, "CAT-NB", 6)) {
-        out.rat = RadioAccessTechnology::LTE_NB_IOT;
-    }
-    else {
-        return SYSTEM_ERROR_NOT_SUPPORTED;
-    }
-
-    out.mcc = ret.mcc;
-    out.mnc = ret.mnc;
-    out.cellId = ret.cellId;
-    out.tac = ret.tac;
-    out.signalPower = ret.signalPower;
-
-    return SYSTEM_ERROR_NONE;
-}
-
-int TrackerLocation::serving_cb(int type, const char* buf, int len, TrackerLocation* context) {
-    if (type == TYPE_OK) {
-        return RESP_OK;
-    }
-
-    (void)parseServeCell(buf, context->servingTower);
-    return WAIT;
-}
-
-int TrackerLocation::parseCell(const char* in, CellularNeighbors& out) {
-    CellularNeighbors ret;
-    char rat[16] = {0};
-
-    auto nitems = sscanf(in, " +QENG: \"neighbourcell %*15[^\"]\",\"%15[^\"]\",%lu,%lu,%d,%d,%d",
-            rat,
-            &ret.earfcn, &ret.neighborId, &ret.signalQuality, &ret.signalPower, &ret.signalStrength);
-
-    if (nitems < 6) {
-        return SYSTEM_ERROR_NOT_ENOUGH_DATA;
-    }
-
-    if (!strncmp(rat, "CAT-M", 5)) {
-        out.rat = RadioAccessTechnology::LTE_CAT_M1;
-    }
-    else if (!strncmp(rat, "LTE", 3)) {
-        out.rat = RadioAccessTechnology::LTE;
-    }
-    else if (!strncmp(rat, "CAT-NB", 6)) {
-        out.rat = RadioAccessTechnology::LTE_NB_IOT;
-    }
-    else {
-        return SYSTEM_ERROR_NOT_SUPPORTED;
-    }
-
-    out.earfcn = ret.earfcn;
-    out.neighborId = ret.neighborId;
-    out.signalQuality = ret.signalQuality;
-    out.signalPower = ret.signalPower;
-    out.signalStrength = ret.signalStrength;
-
-    return SYSTEM_ERROR_NONE;
-}
-
-int TrackerLocation::neighbor_cb(int type, const char* buf, int len, TrackerLocation* context) {
-    if (type == TYPE_OK) {
-        return RESP_OK;
-    }
-
-    CellularNeighbors neighbor;
-    if (parseCell(buf, neighbor) == SYSTEM_ERROR_NONE) {
-        context->towerList.append(neighbor);
-    }
-
-    return WAIT;
+    triggerLocPub(Trigger::NORMAL, zoneStr);
 }
 
 size_t TrackerLocation::buildTowerInfo(JSONBufferWriter& writer, size_t size) {
@@ -719,10 +697,13 @@ size_t TrackerLocation::buildTowerInfo(JSONBufferWriter& writer, size_t size) {
         return 0;
     }
 
+    TrackerCellular::instance().startScan();
+    delay(TRACKER_CELLULAR_SCAN_DELAY);
     size_t written = writer.dataSize();
 
     // The cellular information here is always sent and not configurable
-    Cellular.command(serving_cb, this, 10000, "AT+QENG=\"servingcell\"\r\n");
+    CellularServing servingTower {};
+    TrackerCellular::instance().getServingTower(servingTower);
     if (servingTower.rat != RadioAccessTechnology::NONE) {
         writer.name("towers").beginArray();
         writer.beginObject();
@@ -734,8 +715,8 @@ size_t TrackerLocation::buildTowerInfo(JSONBufferWriter& writer, size_t size) {
         writer.name("str").value(servingTower.signalPower);
         writer.endObject();
 
-        towerList.clear();
-        (void)Cellular.command(neighbor_cb, this, 10000, "AT+QENG=\"neighbourcell\"\r\n");
+        Vector<CellularNeighbor> towerList;
+        TrackerCellular::instance().getNeighborTowers(towerList);
         auto towerCount = TrackerLocationMaxTowerSend - 1;  // one has already been taken as the serving tower
         for (auto tower: towerList) {
             if (towerCount-- <= 0) {
@@ -782,7 +763,14 @@ size_t TrackerLocation::buildWpsInfo(JSONBufferWriter& writer, size_t size) {
         }
 
         wpsList.clear();
+
+        // Power on and immediately scan for access points then power off
+        WiFi.on();
+        delay(WifiPowerOnSec * 1000);
         (void)WiFi.scan(wifi_cb, this);
+        delay(WifiPowerScanSec * 1000);
+        WiFi.off();
+
         // NOTE: Any sorting of WiFi access points should be performed here
         if (!wpsList.isEmpty()) {
             writer.name("wps").beginArray();
@@ -816,14 +804,13 @@ GnssState TrackerLocation::loopLocation(LocationPoint& cur_loc) {
     LocationService::instance().getStatus(locStatus);
 
     do {
-        if (!locStatus.powered) {
-            currentGnssState = GnssState::OFF;
+        if (locStatus.error || (LocationService::instance().getLocation(cur_loc) != SYSTEM_ERROR_NONE)) {
+            currentGnssState = GnssState::ERROR;
             break;
         }
 
-        if (LocationService::instance().getLocation(cur_loc) != SYSTEM_ERROR_NONE)
-        {
-            currentGnssState = GnssState::ERROR;
+        if (!locStatus.powered) {
+            currentGnssState = GnssState::OFF;
             break;
         }
 
@@ -837,10 +824,10 @@ GnssState TrackerLocation::loopLocation(LocationPoint& cur_loc) {
             break;
         }
 
-        float radius;
+        float radius {0.0};
         LocationService::instance().getRadiusThreshold(radius);
         if (radius) {
-            bool outside;
+            bool outside {false};
             LocationService::instance().isOutsideRadius(outside, cur_loc);
             if (outside) {
                 triggerLocPub(Trigger::NORMAL,"radius");
@@ -868,7 +855,7 @@ GnssState TrackerLocation::loopLocation(LocationPoint& cur_loc) {
     return currentGnssState;
 }
 
-void TrackerLocation::buildPublish(LocationPoint& cur_loc) {
+void TrackerLocation::buildPublish(LocationPoint& cur_loc, bool error) {
     bool locked = (_config_state.gnss) ? cur_loc.locked : false;
 
     if(locked) {
@@ -889,7 +876,9 @@ void TrackerLocation::buildPublish(LocationPoint& cur_loc) {
             cloud_service.writer().name("hd").value(cur_loc.heading, 2);
             cloud_service.writer().name("spd").value(cur_loc.speed, 2);
             cloud_service.writer().name("h_acc").value(cur_loc.horizontalAccuracy, 3);
+            cloud_service.writer().name("hdop").value(cur_loc.horizontalDop, 1);
             cloud_service.writer().name("v_acc").value(cur_loc.verticalAccuracy, 3);
+            cloud_service.writer().name("vdop").value(cur_loc.verticalDop, 1);
         }
     }
     else {
@@ -902,9 +891,14 @@ void TrackerLocation::buildPublish(LocationPoint& cur_loc) {
 
     cloud_service.writer().endObject();
 
-    if(!_pending_triggers.isEmpty()) {
+    // Errors are handled separately from normal triggers so that the error doesn't cause the
+    // minimum publish times to be invoked as other normal triggers would
+    if (error || !_pending_triggers.isEmpty()) {
         std::lock_guard<RecursiveMutex> lg(mutex);
         cloud_service.writer().name("trig").beginArray();
+        if (error) {
+            cloud_service.writer().value("err");
+        }
         for (auto trigger : _pending_triggers) {
             cloud_service.writer().value(trigger);
         }
@@ -931,62 +925,55 @@ void TrackerLocation::buildPublish(LocationPoint& cur_loc) {
 
 void TrackerLocation::loop() {
     // The rest of this loop should only sample as fast as necessary
-    if (millis() - _loopSampleTick < LoopSampleRate)
-    {
+    if (_pendingShutdown || (millis() - _loopSampleTick < LoopSampleRate)) {
         return;
     }
+
+    LocationPublish::instance().tick();
 
     bool firstLoop = (_loopSampleTick == 0);
     _loopSampleTick = millis();
 
     // Sync power state changes
-    tracker_location_config_t captureConfig = _config_state;
+    // The rest of this loop will depend on a constant setting for GNSS and WiFi condif state
+    _config_state_loop_safe = _config_state;
 
     if (firstLoop) {
-        if (captureConfig.gnss) {
-            enableGnss();
-        }
-        if (captureConfig.enhance_loc && captureConfig.wps) {
-            enableWifi();
-        }
-        else if (captureConfig.enhance_loc && !captureConfig.wps) {
-            disableWifi();
-        }
-    }
-    else {
-        LocationStatus gnssPoweredStatus;
-        LocationService::instance().getStatus(gnssPoweredStatus);
-        if (captureConfig.gnss && !gnssPoweredStatus.powered) {
-            enableGnss();
-        }
-        else if (!captureConfig.gnss && gnssPoweredStatus.powered) {
-            disableGnss();
-        }
-
-        if (captureConfig.enhance_loc && captureConfig.wps && !_config_state_loop_safe.wps) {
-            enableWifi();
-        }
-        else if (captureConfig.enhance_loc && !captureConfig.wps && _config_state_loop_safe.wps) {
-            disableWifi();
-        }
+        setGnssCycle();
     }
 
-    // The rest of this loop will depend on a constant setting for GNSS and WiFi condif state
-    _config_state_loop_safe = captureConfig;
-
-    // First take care of any retry attempts of last loc
-    if (location_publish_retry_str && Particle.connected())
-    {
-        Log.info("retry failed publish");
-        location_publish();
+    if ((_geofenceConfig.interval && _pendingGeofence) ||
+        (_config_state_loop_safe.gnss && _sleep.isFullWakeCycle() && (0 != getGnssCycle()))) {
+        _pendingGeofence = false;
+        // This is safe to call repeatedly
+        enableGnss();
+    } else  if (!_config_state_loop_safe.gnss){
+        // This is safe to call repeatedly
+        disableGnss();
     }
 
     // Gather current location information and status
-    LocationPoint cur_loc;
+    LocationPoint cur_loc = {};
     auto locationStatus = loopLocation(cur_loc);
 
+    // Override the location status if still retrying
+    if ((GnssState::ERROR == locationStatus) && (0 != getGnssCycle())) {
+        locationStatus = GnssState::ON_UNLOCKED;
+    }
+    // Only evaluate geofence if GNSS lock is stable
+    if (_config_state_loop_safe.gnss && _sleep.isFullWakeCycle() && _geofence.AnyGeofenceEnabled() && LocationService::instance().isLockStable()) {
+        // Update geofence data
+        PointData geofence_point;
+        geofence_point.lat = cur_loc.latitude;
+        geofence_point.lon = cur_loc.longitude;
+        geofence_point.hdop = cur_loc.horizontalDop;
+
+        _geofence.UpdateGeofencePoint(geofence_point);
+        _geofence.loop();
+    }
+
     // Perform interval evaluation
-    auto publishReason = evaluatePublish();
+    auto publishReason = evaluatePublish(GnssState::ERROR == locationStatus);
 
     // This evaluation may have performed earlier and determined that no network was needed.  Check again
     // because this loop may overlap with required network operations.
@@ -998,6 +985,7 @@ void TrackerLocation::loop() {
 
     //                                   : NONE      TIME        TRIG        IMM
     //                                    ----------------------------------------
+    // GnssState::ERROR                     NA       PUB         PUB         PUB
     // GnssState::DISABLED                  NA       PUB         PUB         PUB
     // GnssState::OFF                       NA       PUB         PUB         PUB
     // GnssState::ON_UNLOCKED               NA       WAIT        WAIT        PUB
@@ -1012,6 +1000,8 @@ void TrackerLocation::loop() {
 
         case PublishReason::TIME: {
             switch (locationStatus) {
+                case GnssState::ERROR:
+                // fall through
                 case GnssState::DISABLED:
                 // fall through
                 case GnssState::ON_LOCKED_STABLE: {
@@ -1032,7 +1022,7 @@ void TrackerLocation::loop() {
                         publishNow = true;
                         break;
                     }
-                    Log.trace("waiting for stable GNSS lock for max interval");
+                    //Log.trace("waiting for stable GNSS lock for max interval");
                     break;
                 }
             }
@@ -1041,6 +1031,8 @@ void TrackerLocation::loop() {
 
         case PublishReason::TRIGGERS: {
             switch (locationStatus) {
+                case GnssState::ERROR:
+                // fall through
                 case GnssState::DISABLED:
                 // fall through
                 case GnssState::ON_LOCKED_STABLE: {
@@ -1082,19 +1074,11 @@ void TrackerLocation::loop() {
     //
 
     // then of any new publish
-    if(publishNow && Particle.connected())
+    if(publishNow && (Particle.connected() ||
+            LocationPublish::instance().isStoreEnabled()))
     {
-        if(location_publish_retry_str)
-        {
-            Log.info("freeing unsuccessful retry");
-            // retried attempt not completed in time for new publish
-            // drop and issue callbacks
-            issue_location_publish_callbacks(CloudServiceStatus::TIMEOUT, NULL, location_publish_retry_str);
-            free(location_publish_retry_str);
-            location_publish_retry_str = nullptr;
-        }
         Log.info("publishing now...");
-        buildPublish(cur_loc);
+        buildPublish(cur_loc, (0 == getGnssCycle()));
         pendingLocPubCallbacks = locPubCallbacks;
         locPubCallbacks.clear();
         _last_location_publish_sec = System.uptime();

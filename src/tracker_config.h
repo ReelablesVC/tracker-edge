@@ -36,12 +36,15 @@
 //
 // Variables that can be passed in through compile flags (not Workbench)
 //
+// Simple macro to check if the product ID needs to be specified
+#define TRACKER_PRODUCT_NEEDED                ((SYSTEM_VERSION >> 24) == 3)
+
 #ifndef TRACKER_PRODUCT_ID
 #define TRACKER_PRODUCT_ID                    (PLATFORM_ID)
 #endif
 
 #ifndef TRACKER_PRODUCT_VERSION
-#define TRACKER_PRODUCT_VERSION               (14)
+#define TRACKER_PRODUCT_VERSION               (18)
 #endif
 
 
@@ -56,6 +59,7 @@
 #define UBLOX_SPI_INTERFACE                   (SPI1)
 #define UBLOX_CS_PIN                          (GPS_CS)
 #define UBLOX_PWR_EN_PIN                      (GPS_PWR)
+#define UBLOX_RESETN_PIN                      (GPS_RST)
 #define UBLOX_TX_READY_MCU_PIN                (GPS_INT)
 #define UBLOX_TX_READY_GPS_PIN                (14) // PIO 14 is EXTINT on GPS Module
 

@@ -18,6 +18,7 @@
 
 #include "dct.h"
 #include "deviceid_hal.h"
+#include "exrtc_hal.h"
 
 #include "tracker_config.h"
 
@@ -25,7 +26,6 @@
 #include "config_service.h"
 #include "location_service.h"
 #include "motion_service.h"
-#include "AM1805.h"
 
 #include "tracker_sleep.h"
 #include "tracker_location.h"
@@ -35,6 +35,36 @@
 #include "gnss_led.h"
 #include "temperature.h"
 #include "mcp_can.h"
+#include "memfault.h"
+
+//
+// Default configuration
+//
+#ifndef TRACKER_CONFIG_ENABLE_IO
+// Enable or disable IO/CAN power at initialization, see TrackerConfiguration below
+#define TRACKER_CONFIG_ENABLE_IO              (true)
+#endif
+
+#ifndef TRACKER_CONFIG_ENABLE_IO_SLEEP
+// Enable or disable IO/CAN power shutdown prior to sleep, see TrackerConfiguration below
+#define TRACKER_CONFIG_ENABLE_IO_SLEEP        (false)
+#endif
+
+#ifndef TRACKER_CONFIG_DISABLE_CHARGING
+// Enable or disable LiPo charging. Also available to the user application. See TrackerConfiguration below
+#define TRACKER_CONFIG_DISABLE_CHARGING       (false)
+#endif
+
+#ifndef TRACKER_CONFIG_ENABLE_FAST_LOCK
+// Enable or disable faster GNSS lock based on HDOP, see TrackerConfiguration below
+#define TRACKER_CONFIG_ENABLE_FAST_LOCK       (false)
+#endif
+
+#ifndef TRACKER_CONFIG_GNSS_RETRY_COUNT
+// GNSS initialization retry count, see TrackerConfiguration below
+#define TRACKER_CONFIG_GNSS_RETRY_COUNT       (1)
+#endif
+
 
 struct TrackerCloudConfig {
     bool UsbCommandEnable;
@@ -62,9 +92,11 @@ public:
      *
      */
     TrackerConfiguration() :
-        _enableIo(true),
-        _enableIoSleep(false) {
-
+        _enableIo(TRACKER_CONFIG_ENABLE_IO),
+        _enableIoSleep(TRACKER_CONFIG_ENABLE_IO_SLEEP),
+        _disableCharging(TRACKER_CONFIG_DISABLE_CHARGING),
+        _gnssRetryCount(TRACKER_CONFIG_GNSS_RETRY_COUNT),
+        _locationServiceConfig(LocationServiceConfiguration()) {
     }
 
     /**
@@ -115,18 +147,106 @@ public:
         return _enableIoSleep;
     }
 
+    /**
+     * @brief Disable or enable LiPo battery charging. Can be overridden in the user app with forceDisableCharging()
+     *
+     * @param disable Disable charging of the LiPo
+     * @return TrackerConfiguration&
+     */
+    TrackerConfiguration& disableCharging(bool disable) {
+        _disableCharging = disable;
+        return *this;
+    }
+
+    /**
+     * @brief Indicate if charging is disabled or not
+     *
+     * @return true Charging is disabled
+     * @return false Charging is enabled
+     */
+    bool disableCharging() const {
+        return _disableCharging;
+    }
+
+    /**
+     * @brief Enable or disable faster GNSS lock based on HDOP.  May result in poor horizontal accuracy.
+     *
+     * @param enable Use faster method for GNSS lock state
+     * @return TrackerConfiguration&
+     */
+    TrackerConfiguration& enableFastLock(bool enable) {
+        _locationServiceConfig.enableFastLock(enable);
+        return *this;
+    }
+
+    /**
+     * @brief Indicate if faster GNSS lock based on HDOP is enabled.
+     *
+     * @return true Faster GNSS lock is enabled
+     * @return false Faster GNSS lock is disabled
+     */
+    bool enableFastLock() const {
+        return _locationServiceConfig.enableFastLock();
+    }
+
+    /**
+     * @brief Set GNSS initialization retry count.
+     *
+     * @param count Number of retry attemps for GNSS initialization
+     * @return TrackerConfiguration&
+     */
+    TrackerConfiguration& gnssRetryCount(unsigned int count) {
+        _gnssRetryCount = count;
+        return *this;
+    }
+
+    /**
+     * @brief Get GNSS initialization retry count.
+     *
+     * @return unsigned int Number of retry attemps for GNSS initialization
+     */
+    unsigned int gnssRetryCount() const {
+        return _gnssRetryCount;
+    }
+
+    /**
+     * @brief Set LocationServiceConfiguration object
+     *
+     * @param locServConfig config object for the Location Service
+     * @return TrackerConfiguration&
+     */
+    TrackerConfiguration& locationServiceConfig(LocationServiceConfiguration& locServConfig) {
+        _locationServiceConfig = locServConfig;
+        return *this;
+    }
+
+    /**
+     * @brief Get LocationServiceConfiguration object
+     *
+     * @return Location Service configuration object reference
+     */
+    LocationServiceConfiguration& locationServiceConfig() {
+        return _locationServiceConfig;
+    }
+
     TrackerConfiguration& operator=(const TrackerConfiguration& rhs) {
         if (this == &rhs) {
             return *this;
         }
         this->_enableIo = rhs._enableIo;
         this->_enableIoSleep = rhs._enableIoSleep;
+        this->_disableCharging = rhs._disableCharging;
+        this->_gnssRetryCount = rhs._gnssRetryCount;
+        this->_locationServiceConfig = rhs._locationServiceConfig;
 
         return *this;
     }
 private:
     bool _enableIo;
     bool _enableIoSleep;
+    bool _disableCharging;
+    unsigned int _gnssRetryCount;
+    LocationServiceConfiguration _locationServiceConfig;
 };
 
 // this class encapsulates the underlying modules and builds on top of them to
@@ -185,6 +305,13 @@ class Tracker {
         int end();
 
         /**
+         * @brief Prepare tracker for reset and issue
+         *
+         * @return SYSTEM_ERROR_NONE
+         */
+        int reset();
+
+        /**
          * @brief Get the tracker hardware model number
          *
          * @return uint32_t Model number
@@ -203,18 +330,32 @@ class Tracker {
         }
 
         /**
-         * @brief Enable battery charging
+         * @brief Set the GNSS fast lock
          *
-         * @retval SYSTEM_ERROR_NONE
+         * @param enable Enable faster GNSS lock
          */
-        int enableCharging();
+        void setFastLock(bool enable) {
+            _deviceConfig.enableFastLock(enable);
+            locationService.setFastLock(enable);
+        }
 
         /**
-         * @brief Disable battery charging
+         * @brief Get the GNSS fast lock
          *
-         * @retval SYSTEM_ERROR_NONE
+         * @return true Faster GNSS lock is enabled
+         * @return false Faster GNSS lock is disabled
          */
-        int disableCharging();
+        bool getFastLock() const {
+            return locationService.getFastLock();;
+        }
+
+        /**
+         * @brief Manually force off battery charging
+         *
+         * @param value true charging will be disabled (not re-enabled by Tracker Edge)
+         * @param value false charging will revert to original logic (handled by Tracker Edge)
+         */
+        void forceDisableCharging(bool value);
 
         /**
          * @brief Force battery charge current
@@ -266,15 +407,18 @@ class Tracker {
          */
         int prepareWake();
 
+        /**
+         * @brief Callback to collect Memfault metrics for heartbeat publishes
+         *
+         */
+        void collectMemfaultHeartbeatMetrics();
+
         // underlying services exposed to allow sharing with rest of the system
         CloudService &cloudService;
         ConfigService &configService;
         TrackerSleep &sleep;
         LocationService &locationService;
         MotionService &motionService;
-
-        AM1805 rtc;
-
         TrackerLocation &location;
         TrackerMotion &motion;
         TrackerShipping &shipping;
@@ -286,6 +430,7 @@ class Tracker {
         int chargeCallback(TemperatureChargeEvent event);
 
         static Tracker* _instance;
+        Memfault *_memfault {nullptr};
         TrackerCloudConfig _cloudConfig;
         TrackerConfiguration _deviceConfig;
 
@@ -304,13 +449,14 @@ class Tracker {
         TrackerChargeState _chargeStatus;
         unsigned int _lowBatteryEvent;
         unsigned int _evalChargingTick;
-        bool _batteryChargeEnabled;
+        bool _batterySafeToCharge;
+        bool _forceDisableCharging;
+        bool _deviceMonitoring {false};
 
         // Startup and initialization related
         static int getPowerManagementConfig(hal_power_config& conf);
         static int setPowerManagementConfig(const hal_power_config& conf);
         static int enablePowerManagement();
-        static void completeSetupDone();
         int initEsp32();
         int initCan();
         int initIo();
@@ -335,4 +481,14 @@ class Tracker {
         void initBatteryMonitor();
         bool getChargeEnabled();
         void evaluateBatteryCharge();
+        int pmicEnableCharging();
+        int pmicDisableCharging();
+
+        /**
+         * @brief Handle OTA events from System.on() interface
+         *
+         * @param event Event class
+         * @param data Particular event
+         */
+        void otaHandler(system_event_t event, int data);
 };
